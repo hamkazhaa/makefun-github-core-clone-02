@@ -197,13 +197,25 @@ function pkt(payload: string | Buffer): Buffer {
   return Buffer.concat([head, data]);
 }
 
+// The flush and delim packets never change: build them once instead of
+// allocating two fresh Buffers on every pktFlush()/pktDelim() call.
+const PKT_FLUSH_BUF = utf8('0000');
+const PKT_DELIM_BUF = utf8('0001');
+
 function pktFlush(): Buffer {
-  return utf8('0000');
+  return PKT_FLUSH_BUF;
 }
 
 function pktDelim(): Buffer {
-  return utf8('0001');
+  return PKT_DELIM_BUF;
 }
+
+// Fixed pkt-lines on the fetch/advertisement paths, also built once.
+const PKT_PACKFILE = pkt('packfile\n');
+const PKT_SHALLOW_INFO = pkt('shallow-info\n');
+const PKT_ACKNOWLEDGMENTS = pkt('acknowledgments\n');
+const PKT_READY = pkt('ready\n');
+const PKT_NAK = pkt('NAK\n');
 
 type DecodedPacket =
   | { kind: 'data'; payload: Buffer }
@@ -504,7 +516,7 @@ interface Repo {
   advV0Up: Buffer | null;
   advV0Recv: Buffer | null;
   lsCache: Map<string, Buffer>;
-  packCache: Map<string, Buffer>;
+  fetchCache: Map<string, Buffer>;
   repoJsonCache: Buffer | null;
 }
 
@@ -538,7 +550,7 @@ function newRepo(owner: string, name: string, description: string, isPrivate: bo
     advV0Up: null,
     advV0Recv: null,
     lsCache: new Map(),
-    packCache: new Map(),
+    fetchCache: new Map(),
     repoJsonCache: null,
   };
   repos.set(repoKey(owner, name), repo);
@@ -551,7 +563,7 @@ function bump(repo: Repo): void {
   repo.advV0Up = null;
   repo.advV0Recv = null;
   repo.lsCache.clear();
-  repo.packCache.clear();
+  repo.fetchCache.clear();
   repo.repoJsonCache = null;
 }
 
@@ -559,6 +571,13 @@ function putObject(repo: Repo, type: ObjType, data: Buffer): string {
   const oid = objectId(type, data);
   if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
   return oid;
+}
+
+// Store an object whose oid the caller already computed (readPack hashes
+// every entry it returns): hashing it again here would pay a second SHA-1
+// per object on every push.
+function putObjectWithOid(repo: Repo, type: ObjType, data: Buffer, oid: string): void {
+  if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
 }
 
 function getObject(repo: Repo, oid: string): GitObject | undefined {
@@ -1111,15 +1130,25 @@ function planFetch(repo: Repo, wants: string[], haves: string[], depth: number |
   return { objects, shallow: boundary, unshallow };
 }
 
+// One pre-sized Buffer instead of a concat per 32 KiB chunk plus a final
+// concat over them: the fetch path wraps every pack this way.
 function sidebandPack(pack: Buffer): Buffer {
-  const parts: Buffer[] = [];
   const CHUNK = 32768;
-  for (let at = 0; at < pack.length; at += CHUNK) {
-    const slice = pack.subarray(at, Math.min(pack.length, at + CHUNK));
-    parts.push(pkt(Buffer.concat([Buffer.from([1]), slice])));
+  const chunks = Math.max(1, Math.ceil(pack.length / CHUNK));
+  const out = Buffer.allocUnsafe(pack.length + chunks * 5);
+  let at = 0;
+  for (let off = 0; off < pack.length; off += CHUNK) {
+    const len = Math.min(CHUNK, pack.length - off);
+    out.write((len + 5).toString(16).padStart(4, '0'), at, 4, 'ascii');
+    out[at + 4] = 1;
+    pack.copy(out, at + 5, off, off + len);
+    at += len + 5;
   }
-  if (pack.length === 0) parts.push(pkt(Buffer.from([1])));
-  return Buffer.concat(parts);
+  if (pack.length === 0) {
+    out.write('0005', 0, 4, 'ascii');
+    out[4] = 1;
+  }
+  return out;
 }
 
 function handleFetchV2(repo: Repo, args: string[], res: ServerResponse): void {
@@ -1142,7 +1171,7 @@ function handleFetchV2(repo: Repo, args: string[], res: ServerResponse): void {
   // `done`). Without `done`, answer acknowledgments alone and wait for the
   // client's next round.
   if (!done) {
-    const ackParts: Buffer[] = [pkt('acknowledgments\n')];
+    const ackParts: Buffer[] = [PKT_ACKNOWLEDGMENTS];
     let acked = false;
     for (const have of haves) {
       if (repo.objects.has(have)) {
@@ -1150,37 +1179,37 @@ function handleFetchV2(repo: Repo, args: string[], res: ServerResponse): void {
         acked = true;
       }
     }
-    ackParts.push(pkt(acked ? 'ready\n' : 'NAK\n'));
+    ackParts.push(acked ? PKT_READY : PKT_NAK);
     ackParts.push(pktFlush());
     sendRaw(res, 200, 'application/x-git-upload-pack-result', Buffer.concat(ackParts));
     return;
   }
   const cacheKey = `${wants.slice().sort().join(',')}|${haves.slice().sort().join(',')}|${depth ?? ''}|${shallow.slice().sort().join(',')}`;
-  const cachedPack = repo.packCache.get(cacheKey);
-  let plan: FetchPlan;
-  let pack: Buffer;
-  if (cachedPack !== undefined) {
-    pack = cachedPack;
-    plan = { objects: [], shallow: [], unshallow: [] };
-    // Recompute only the shallow lists (cheap: no object walk over the pack).
-    const recomputed = planFetch(repo, wants, haves, depth, shallow);
-    plan = { objects: [], shallow: recomputed.shallow, unshallow: recomputed.unshallow };
-  } else {
-    plan = planFetch(repo, wants, haves, depth, shallow);
-    pack = writePack(plan.objects);
-    repo.packCache.set(cacheKey, pack);
+  // The whole fetch response is deterministic for (repo version, cache key):
+  // cache the assembled bytes, not just the pack, so a repeat fetch is one
+  // Map lookup and one write. bump() clears this on every ref write, so a
+  // cached response can never serve stale refs; its staleness profile is the
+  // same as the pack cache it replaces.
+  const cachedResponse = repo.fetchCache.get(cacheKey);
+  if (cachedResponse !== undefined) {
+    sendRaw(res, 200, 'application/x-git-upload-pack-result', cachedResponse);
+    return;
   }
+  const plan = planFetch(repo, wants, haves, depth, shallow);
+  const pack = writePack(plan.objects);
   const parts: Buffer[] = [];
   if (plan.shallow.length > 0 || plan.unshallow.length > 0) {
-    parts.push(pkt('shallow-info\n'));
+    parts.push(PKT_SHALLOW_INFO);
     for (const oid of plan.shallow) parts.push(pkt(`shallow ${oid}\n`));
     for (const oid of plan.unshallow) parts.push(pkt(`unshallow ${oid}\n`));
     parts.push(pktFlush());
   }
-  parts.push(pkt('packfile\n'));
+  parts.push(PKT_PACKFILE);
   parts.push(sidebandPack(pack));
   parts.push(pktFlush());
-  sendRaw(res, 200, 'application/x-git-upload-pack-result', Buffer.concat(parts));
+  const body = Buffer.concat(parts);
+  repo.fetchCache.set(cacheKey, body);
+  sendRaw(res, 200, 'application/x-git-upload-pack-result', body);
 }
 
 function handleFetchV0(repo: Repo, body: Buffer, res: ServerResponse): void {
@@ -1215,19 +1244,19 @@ function handleFetchV0(repo: Repo, body: Buffer, res: ServerResponse): void {
 }
 
 function handleUploadPack(repo: Repo, body: Buffer, isV2: boolean, res: ServerResponse): void {
-  let lines: string[];
+  // One parse only: the text-line pass used to run here as well, but its
+  // result was discarded (the command scan below re-decodes the packets),
+  // so it was pure work on every upload-pack request. decodePktLines
+  // throws the same errors for a malformed stream, so the 400 stays.
+  let packets: DecodedPacket[];
   try {
-    lines = pktTextLines(body);
+    packets = decodePktLines(body);
   } catch {
     sendJson(res, 400, errBody('malformed pkt-line stream'));
     return;
   }
-  const first = (lines[0] ?? '').replace(/\n$/, '');
-  const delimAt = lines.findIndex((l) => l === '');
-  void delimAt;
   // The request is pkt-lines; a delim packet decodes as an empty text line only
   // when its payload is empty, so find the command by scanning raw packets.
-  const packets = decodePktLines(body);
   let command = '';
   const args: string[] = [];
   let seenDelim = false;
@@ -1244,7 +1273,6 @@ function handleUploadPack(repo: Repo, body: Buffer, isV2: boolean, res: ServerRe
     }
     if (text !== '') args.push(text);
   }
-  void first;
   if (!isV2) {
     handleFetchV0(repo, body, res);
     return;
@@ -1307,7 +1335,7 @@ function handleReceivePack(repo: Repo, body: Buffer, res: ServerResponse): void 
   if (packStart >= 0 && packStart < raw.length) {
     try {
       const entries = readPack(raw.subarray(packStart), (oid) => repo.objects.get(oid));
-      for (const entry of entries) putObject(repo, entry.type, entry.data);
+      for (const entry of entries) putObjectWithOid(repo, entry.type, entry.data, entry.oid);
     } catch (err) {
       unpackOk = false;
       unpackDetail = err instanceof Error ? err.message : 'unpack failed';

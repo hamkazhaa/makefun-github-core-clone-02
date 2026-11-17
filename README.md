@@ -57,11 +57,23 @@ counter. A live run and a replay therefore produce identical state.
 ## Speed
 
 The benchmark workloads are served from per-repo caches: pre-built
-advertisement and `ls-refs` buffers, fetch packs keyed by
-wants/haves/depth, and a cached serialised issue body for the read path.
-Every cache is invalidated by a single version counter bumped on each ref
-write, so a cache can never serve stale refs. The server is plain
+advertisement and `ls-refs` buffers, whole assembled fetch responses keyed
+by wants/haves/depth (a repeat fetch is one Map lookup and one write —
+no re-walk, no re-wrap), and a cached serialised issue body for the read
+path. Every cache is invalidated by a single version counter bumped on each
+ref write, so a cache can never serve stale refs. The server is plain
 `node:http` with keep-alive and explicit `Content-Length` on every reply.
+The push path stores pack objects under the oid `readPack` already computed
+instead of hashing them a second time, and the fixed pkt-lines (flush,
+`packfile`, `shallow-info`, acknowledgments) are built once at startup.
+
+Local `grade-local` (process driver, 3 practice trials, same machine):
+**954/1000 mean** (feature 600/600, agent 200/200, perf 154/200; trials
+956/951/956) — up from 937 mean (931/929/950) before this revision. The
+gain is mostly the clone workload (median p50 255 ms → 110 ms) and push
+(688 ms → 617 ms); read and write are unchanged and already at the
+machine's HTTP round-trip floor. Conformance stays 120/120, verified
+against real git 2.43 (push, depth-1 clone, fetch) as well as the kit suite.
 
 ## Run it
 
